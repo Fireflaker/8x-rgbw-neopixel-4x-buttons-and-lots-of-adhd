@@ -1,0 +1,622 @@
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+
+#define NUMPIXELS 8
+#define LED_PIN   6
+
+Adafruit_NeoPixel pixels(NUMPIXELS, LED_PIN, NEO_GRBW + NEO_KHZ800);
+
+// --- Exact button wiring (your decoded pairs) ---
+#define BTN_PLUS_IRQ   1
+#define BTN_PLUS_GND   3
+#define BTN_MINUS_IRQ  0
+#define BTN_MINUS_GND  A5
+#define BTN_DISCO_IRQ  A2
+#define BTN_DISCO_GND  A4
+#define BTN_BIG_IRQ    8
+#define BTN_BIG_GND    10
+
+// ---------- Color type ----------
+struct RGBW {
+  uint8_t r, g, b, w;
+};
+
+// ---------- Small utilities ----------
+static inline uint8_t u8_add_sat(uint8_t a, uint8_t b) {
+  uint16_t s = (uint16_t)a + (uint16_t)b;
+  return (s > 255) ? 255 : (uint8_t)s;
+}
+
+static inline uint8_t u8_sub_floor(uint8_t a, uint8_t b) {
+  return (a > b) ? (uint8_t)(a - b) : 0;
+}
+
+static inline uint8_t u8_scale(uint8_t x, uint8_t scale /*0-255*/) {
+  return (uint16_t)x * (uint16_t)scale / 255;
+}
+
+static inline uint8_t u8_min3(uint8_t a, uint8_t b, uint8_t c) {
+  return min(a, min(b, c));
+}
+
+// Simple HSV->RGB (8-bit)
+static RGBW hsv2rgb(uint8_t h, uint8_t s, uint8_t v) {
+  RGBW out{0, 0, 0, 0};
+  if (s == 0) { out.r = out.g = out.b = v; return out; }
+
+  uint8_t region   = h / 43; // 0..5
+  uint8_t remainder = (h - region * 43) * 6;
+  uint8_t p = (uint16_t)v * (255 - s) / 255;
+  uint8_t q = (uint16_t)v * (255 - ((uint16_t)s * remainder) / 255) / 255;
+  uint8_t t = (uint16_t)v * (255 - ((uint16_t)s * (255 - remainder)) / 255) / 255;
+
+  switch (region) {
+    case 0: out.r = v; out.g = t; out.b = p; break;
+    case 1: out.r = q; out.g = v; out.b = p; break;
+    case 2: out.r = p; out.g = v; out.b = t; break;
+    case 3: out.r = p; out.g = q; out.b = v; break;
+    case 4: out.r = t; out.g = p; out.b = v; break;
+    default: out.r = v; out.g = p; out.b = q; break;
+  }
+  return out;
+}
+
+// Convert RGB -> RGBW and apply temperature/tint
+static RGBW rgb_to_rgbw_with_temp(uint8_t r, uint8_t g, uint8_t b,
+                                  uint8_t temp /*0 cool..255 warm*/,
+                                  uint8_t whiteBoost /*0..255*/) {
+  RGBW c{r, g, b, 0};
+
+  // Pull shared luminance into W
+  uint8_t m = u8_min3(c.r, c.g, c.b);
+  c.r = u8_sub_floor(c.r, m);
+  c.g = u8_sub_floor(c.g, m);
+  c.b = u8_sub_floor(c.b, m);
+  c.w = m;
+
+  // Boost W
+  c.w = u8_add_sat(c.w, u8_scale(255, whiteBoost));
+
+  // Temperature bias
+  if (temp < 128) {
+    uint8_t cool = (uint8_t)((128 - temp) * 2); // 0..254
+    c.b = u8_add_sat(c.b, cool);
+    c.w = u8_add_sat(c.w, cool / 4);
+  } else {
+    uint8_t warm = (uint8_t)((temp - 128) * 2); // 0..254
+    c.r = u8_add_sat(c.r, warm);
+    c.g = u8_add_sat(c.g, warm / 2);
+    c.w = u8_add_sat(c.w, warm / 5);
+  }
+
+  return c;
+}
+
+// ---------- Channel mask (R,G,B,W) ----------
+// bit0 = R, bit1 = G, bit2 = B, bit3 = W
+uint8_t channelMask = 0b1111;  // start with all channels enabled
+
+const uint32_t doublePressWindowMs = 400; // for plus and disco
+
+// ---------- Pixel write helpers ----------
+static inline void setPixelRGBW(uint16_t i, const RGBW &c) {
+  RGBW mod{c.r, c.g, c.b, c.w};
+
+  if (!(channelMask & 0x01)) mod.r = 0;
+  if (!(channelMask & 0x02)) mod.g = 0;
+  if (!(channelMask & 0x04)) mod.b = 0;
+  if (!(channelMask & 0x08)) mod.w = 0;
+
+  pixels.setPixelColor(i, mod.r, mod.g, mod.b, mod.w);
+}
+
+static inline void fillRGBW(const RGBW &c) {
+  for (uint16_t i = 0; i < NUMPIXELS; i++) setPixelRGBW(i, c);
+}
+
+// ---------- State ----------
+volatile bool isrPlus  = false;
+volatile bool isrMinus = false;
+volatile bool isrDisco = false;
+volatile bool isrBig   = false;
+
+uint32_t lastPressPlus  = 0;
+uint32_t lastPressMinus = 0;
+uint32_t lastPressDisco = 0;
+uint32_t lastPressBig   = 0;
+
+const uint32_t debounceMs = 120;
+
+// Brightness / effect engine
+uint8_t brightness  = 128; // 10..255
+uint8_t effectId    = 0;   // 0..4
+uint8_t speed       = 5;   // 1..10
+uint8_t crazyness   = 5;   // 1..10
+uint8_t hueBase     = 0;
+uint8_t temp        = 140; // 0..255
+
+// Disco flag
+bool discoMode = false;
+
+// Big button override
+bool    bigOverrideActive = false;
+uint8_t bigCycle          = 0; // 0..5
+
+// Jolt animation
+bool     joltActive = false;
+uint32_t joltStart  = 0;
+uint16_t joltMs     = 140;
+uint8_t  joltHue    = 0;
+uint8_t  joltWhite  = 0;
+
+// Timing
+uint32_t lastFrame = 0;
+
+// ---- Minus hold-to-blackout ----
+const uint32_t minusHoldMs = 350;
+static bool     minusPrevDown   = false;
+static uint32_t minusDownSince  = 0;
+
+// ---- Disco hold-for-palette ----
+const uint32_t discoHoldMs = 600;
+static bool     discoPrevDown   = false;
+static uint32_t discoDownSince  = 0;
+static bool     discoHoldHandled = false;
+
+// ---------- Forward declarations ----------
+void setup();
+void loop();
+
+void plusISR();
+void minusISR();
+void discoISR();
+void bigISR();
+
+void handleButtons(uint32_t now);
+
+void startJolt(uint8_t hue, uint8_t whiteAmt);
+bool renderJolt(uint32_t now);
+
+void applyBigCycle();
+void advanceBigCycle();
+
+void brightnessUp();
+void brightnessDown();
+
+void shuffleColorOnly();
+void shuffleSpeedAndEffect();
+void shufflePaletteTemp();
+
+void renderEffects(uint32_t now);
+void fxAurora(uint32_t now);
+void fxComet(uint32_t now);
+void fxConfetti(uint32_t now);
+void fxCandle(uint32_t now);
+void fxDiscoPlasma(uint32_t now);
+
+static inline bool minusIsHeld(uint32_t now);
+void handleDiscoHold(uint32_t now);
+
+// ---------- ISRs (flags only; no LED I/O) ----------
+void plusISR()  { isrPlus  = true; }
+void minusISR() { isrMinus = true; }
+void discoISR() { isrDisco = true; }
+void bigISR()   { isrBig   = true; }
+
+// ---------- Setup ----------
+void setup() {
+  pixels.begin();
+  pixels.setBrightness(brightness);
+  pixels.clear();
+  pixels.show();
+
+  // Button GND outputs LOW
+  pinMode(BTN_PLUS_GND,  OUTPUT); digitalWrite(BTN_PLUS_GND,  LOW);
+  pinMode(BTN_MINUS_GND, OUTPUT); digitalWrite(BTN_MINUS_GND, LOW);
+  pinMode(BTN_DISCO_GND, OUTPUT); digitalWrite(BTN_DISCO_GND, LOW);
+  pinMode(BTN_BIG_GND,   OUTPUT); digitalWrite(BTN_BIG_GND,   LOW);
+
+  // IRQ pins with internal pullups
+  pinMode(BTN_PLUS_IRQ,  INPUT_PULLUP);
+  pinMode(BTN_MINUS_IRQ, INPUT_PULLUP);
+  pinMode(BTN_DISCO_IRQ, INPUT_PULLUP);
+  pinMode(BTN_BIG_IRQ,   INPUT_PULLUP);
+
+  // Interrupts on press (FALLING to GND)
+  attachInterrupt(digitalPinToInterrupt(BTN_PLUS_IRQ),  plusISR,  FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_MINUS_IRQ), minusISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_DISCO_IRQ), discoISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_BIG_IRQ),   bigISR,   FALLING);
+
+  randomSeed(analogRead(A1));
+}
+
+// ---------- Loop ----------
+void loop() {
+  uint32_t now = millis();
+
+  handleButtons(now);
+
+  // Priority 0: holding MINUS forces blackout in any mode/state
+  if (minusIsHeld(now)) {
+    joltActive = false; // prevent jolt from turning lights back on
+    pixels.clear();
+    pixels.show();
+    return;
+  }
+
+  // Disco hold: toggles random palette without changing effect
+  handleDiscoHold(now);
+
+  // Priority 1: jolt animation
+  if (renderJolt(now)) return;
+
+  // Priority 2: big override cycle
+  if (bigOverrideActive) {
+    applyBigCycle();
+    return;
+  }
+
+  // Priority 3: effects engine
+  renderEffects(now);
+}
+
+// ---------- Minus hold detection ----------
+static inline bool minusIsHeld(uint32_t now) {
+  bool down = (digitalRead(BTN_MINUS_IRQ) == LOW); // INPUT_PULLUP: pressed = LOW
+  if (down && !minusPrevDown) {
+    minusDownSince = now;
+  }
+  if (!down) {
+    minusDownSince = 0;
+  }
+  minusPrevDown = down;
+
+  return down &&
+         (minusDownSince != 0) &&
+         (now - minusDownSince >= minusHoldMs);
+}
+
+// ---------- Disco hold behavior ----------
+void handleDiscoHold(uint32_t now) {
+  bool down = (digitalRead(BTN_DISCO_IRQ) == LOW); // INPUT_PULLUP: pressed = LOW
+
+  if (down) {
+    if (!discoPrevDown) {
+      // just pressed
+      discoDownSince   = now;
+      discoHoldHandled = false;
+    } else {
+      // held
+      if (!discoHoldHandled && (discoDownSince != 0) &&
+          (now - discoDownSince >= discoHoldMs)) {
+        // Long hold detected: toggle random palette, keep current effect & speed
+        shufflePaletteTemp(); // changes temp + hueBase only
+        discoHoldHandled = true;
+      }
+    }
+  } else {
+    discoDownSince   = 0;
+    discoHoldHandled = false;
+  }
+
+  discoPrevDown = down;
+}
+
+// ---------- Button handling ----------
+void handleButtons(uint32_t now) {
+  // Snapshot ISR flags quickly
+  bool doPlus, doMinus, doDisco, doBig;
+  noInterrupts();
+  doPlus  = isrPlus;  isrPlus  = false;
+  doMinus = isrMinus; isrMinus = false;
+  doDisco = isrDisco; isrDisco = false;
+  doBig   = isrBig;   isrBig   = false;
+  interrupts();
+
+  // PLUS: brightness up + effect shuffle + channel mask single/double
+  if (doPlus && (now - lastPressPlus > debounceMs)) {
+    uint32_t timeSincePrev = now - lastPressPlus;
+
+    // Channel logic: single resets all, double disables random one
+    if (timeSincePrev > doublePressWindowMs) {
+      // Single press: all channels enabled
+      channelMask = 0b1111;
+    } else {
+      // Double-press: disable one random channel (R,G,B,W)
+      uint8_t chan = (uint8_t)random(4); // 0=R,1=G,2=B,3=W
+      channelMask &= ~(1u << chan);
+    }
+
+    lastPressPlus = now;
+
+    bigOverrideActive = false;
+    brightnessUp();          // always adjust brightness
+    shuffleSpeedAndEffect(); // shuffle speed/effect
+    startJolt(random(256), 120);
+  }
+
+  // MINUS: brightness down + color-only shuffle (short press)
+  // Long-hold blackout is handled separately in minusIsHeld()
+  if (doMinus && (now - lastPressMinus > debounceMs)) {
+    lastPressMinus = now;
+
+    bigOverrideActive = false;
+    brightnessDown();        // always adjust brightness
+    shuffleColorOnly();      // shuffle color, same effect
+    startJolt(random(256), 160);
+  }
+
+  // DISCO: single = toggle disco mode + palette + random white;
+  //        double = change speed only;
+  //        long hold (in handleDiscoHold) = random palette (no effect change).
+  if (doDisco && (now - lastPressDisco > debounceMs)) {
+    uint32_t timeSincePrev = now - lastPressDisco;
+
+    bigOverrideActive = false;
+
+    if (timeSincePrev <= doublePressWindowMs && lastPressDisco != 0) {
+      // Double-click: change animation speed only (keep palette/effect)
+      speed = (uint8_t)random(1, 11);
+      // crazyness left as-is so "feel" remains similar
+    } else {
+      // Single-click: toggle discoMode, random palette, random white on/off
+      discoMode = !discoMode;
+      shufflePaletteTemp();
+
+      // Randomly enable/disable white channel, preserving RGB mask bits
+      uint8_t wbit = (random(2) == 1) ? 0x08 : 0x00;
+      channelMask = (channelMask & 0x07) | wbit;
+    }
+
+    lastPressDisco = now;
+
+    startJolt(random(256), 200);
+  }
+
+  // BIG: override cycle
+  if (doBig && (now - lastPressBig > debounceMs)) {
+    lastPressBig = now;
+
+    if (!bigOverrideActive) {
+      bigOverrideActive = true;
+      bigCycle = 0; // start at white
+    } else {
+      advanceBigCycle();
+    }
+
+    // Jolt, but override resumes after jolt ends
+    startJolt(random(256), 255);
+  }
+}
+
+// ---------- Brightness ----------
+void brightnessUp() {
+  brightness = (brightness >= 230) ? 255 : (uint8_t)(brightness + 25);
+  pixels.setBrightness(brightness);
+}
+
+void brightnessDown() {
+  brightness = (brightness <= 35) ? 10 : (uint8_t)(brightness - 25);
+  pixels.setBrightness(brightness);
+}
+
+// ---------- Shuffles ----------
+void shuffleColorOnly() {
+  // Color changes, effect does not
+  hueBase = (uint8_t)random(256);
+
+  // Nudge temp slightly too
+  int t = (int)temp + (int)random(-25, 26);
+  temp  = (uint8_t)constrain(t, 0, 255);
+}
+
+void shuffleSpeedAndEffect() {
+  speed     = (uint8_t)random(1, 11);
+  crazyness = (uint8_t)random(1, 11);
+
+  if (discoMode) {
+    effectId = 4; // disco plasma
+  } else {
+    effectId = (uint8_t)random(0, 4); // 0..3
+  }
+}
+
+void shufflePaletteTemp() {
+  temp    = (uint8_t)random(256);
+  hueBase = (uint8_t)random(256);
+}
+
+// ---------- Jolt animation ----------
+void startJolt(uint8_t hue, uint8_t whiteAmt) {
+  joltActive = true;
+  joltStart  = millis();
+  joltHue    = hue;
+  joltWhite  = whiteAmt;
+}
+
+// Returns true if it drew this frame
+bool renderJolt(uint32_t now) {
+  if (!joltActive) return false;
+
+  uint32_t dt = now - joltStart;
+  if (dt >= joltMs) {
+    joltActive = false;
+    return false;
+  }
+
+  // Expanding "spark-pop" burst from center with heavy W component
+  float phase  = (float)dt / (float)joltMs; // 0..1
+  int   center = NUMPIXELS / 2;
+  float radius = phase * (NUMPIXELS / 2.0f + 1.0f);
+
+  // Pulse envelope
+  uint8_t env = (phase < 0.5f)
+                ? (uint8_t)(phase * 2.0f * 255)
+                : (uint8_t)((1.0f - phase) * 2.0f * 255);
+
+  RGBW base = hsv2rgb(joltHue, 255, env);
+  RGBW out  = rgb_to_rgbw_with_temp(base.r, base.g, base.b, temp, joltWhite);
+
+  pixels.clear();
+  for (int i = 0; i < NUMPIXELS; i++) {
+    float d = fabsf((float)i - (float)center);
+    float k = 1.0f - min(1.0f, d / max(0.001f, radius));
+    uint8_t s = (uint8_t)(k * 255);
+
+    RGBW c;
+    c.r = u8_scale(out.r, s);
+    c.g = u8_scale(out.g, s);
+    c.b = u8_scale(out.b, s);
+    c.w = u8_scale(out.w, s);
+    setPixelRGBW(i, c);
+  }
+  pixels.show();
+  return true;
+}
+
+// ---------- Big override cycle ----------
+void advanceBigCycle() {
+  bigCycle = (uint8_t)((bigCycle + 1) % 6);
+}
+
+void applyBigCycle() {
+  RGBW c{0, 0, 0, 0};
+
+  switch (bigCycle) {
+    case 0: // warm white flashlight
+      c = RGBW{20, 12, 8, 255};
+      break;
+    case 1: // white + RGB “cream rainbow”
+      c = RGBW{120, 100, 140, 160};
+      break;
+    case 2: // red only
+      c = RGBW{255, 0, 0, 0};
+      break;
+    case 3: // green only
+      c = RGBW{0, 255, 0, 0};
+      break;
+    case 4: // blue only
+      c = RGBW{0, 0, 255, 0};
+      break;
+    case 5: // off
+    default:
+      pixels.clear();
+      pixels.show();
+      return;
+  }
+
+  fillRGBW(c);
+  pixels.show();
+}
+
+// ---------- Effects engine ----------
+void renderEffects(uint32_t now) {
+  uint16_t frameInterval = (uint16_t)max(6, 55 - (speed * 5)); // ~50..5 ms
+  if (now - lastFrame < frameInterval) return;
+  lastFrame = now;
+
+  if (discoMode) {
+    fxDiscoPlasma(now);
+    return;
+  }
+
+  switch (effectId % 4) {
+    case 0: fxAurora(now);  break;
+    case 1: fxComet(now);   break;
+    case 2: fxConfetti(now);break;
+    case 3: fxCandle(now);  break;
+  }
+}
+
+// --- Effect 0: Aurora ---
+void fxAurora(uint32_t now) {
+  uint8_t t8 = (uint8_t)(now / (uint32_t)(12 - min<uint8_t>(10, speed)));
+  for (uint16_t i = 0; i < NUMPIXELS; i++) {
+    uint8_t h = (uint8_t)(hueBase + t8 * (2 + crazyness) + i * (22 + crazyness));
+    uint8_t s = 160;
+    uint8_t v = 180;
+    RGBW rgb = hsv2rgb(h, s, v);
+    RGBW c   = rgb_to_rgbw_with_temp(rgb.r, rgb.g, rgb.b, temp, 120);
+    setPixelRGBW(i, c);
+  }
+  pixels.show();
+}
+
+// --- Effect 1: Comet ---
+void fxComet(uint32_t now) {
+  static int head = 0;
+  static int dir  = 1;
+
+  for (uint16_t i = 0; i < NUMPIXELS; i++) {
+    uint8_t dist = (uint8_t)abs((int)i - head);
+    uint8_t v    = (dist == 0) ? 255 : (dist == 1 ? 110 : 25);
+    uint8_t h    = (uint8_t)(hueBase + now / 10 + i * 10);
+    RGBW rgb     = hsv2rgb(h, 220, v);
+    RGBW c       = rgb_to_rgbw_with_temp(rgb.r, rgb.g, rgb.b, temp,
+                                         (dist == 0) ? 200 : 80);
+    setPixelRGBW(i, c);
+  }
+
+  if (random(0, 10) < (int)crazyness) {
+    // extra tiny white twinkle
+    uint16_t p = (uint16_t)random(NUMPIXELS);
+    RGBW tw{0, 0, 0, (uint8_t)(140 + random(116))};
+    setPixelRGBW(p, tw);
+  }
+
+  head += dir;
+  if (head <= 0 || head >= (NUMPIXELS - 1)) dir = -dir;
+
+  pixels.show();
+}
+
+// --- Effect 2: Confetti ---
+void fxConfetti(uint32_t now) {
+  // Base dim wash
+  for (uint16_t i = 0; i < NUMPIXELS; i++) {
+    uint8_t h = (uint8_t)(hueBase + i * 18 + now / 8);
+    RGBW rgb = hsv2rgb(h, 200, 35);
+    RGBW c   = rgb_to_rgbw_with_temp(rgb.r, rgb.g, rgb.b, temp, 60);
+    setPixelRGBW(i, c);
+  }
+
+  // Random pops
+  uint8_t pops = (uint8_t)(1 + (crazyness / 3));
+  for (uint8_t k = 0; k < pops; k++) {
+    uint16_t p = (uint16_t)random(NUMPIXELS);
+    uint8_t  h = (uint8_t)(hueBase + random(256));
+    RGBW rgb   = hsv2rgb(h, 255, (uint8_t)(180 + random(76)));
+    RGBW c     = rgb_to_rgbw_with_temp(rgb.r, rgb.g, rgb.b, temp, 180);
+    setPixelRGBW(p, c);
+  }
+
+  pixels.show();
+}
+
+// --- Effect 3: Candle ---
+void fxCandle(uint32_t now) {
+  (void)now;
+  for (uint16_t i = 0; i < NUMPIXELS; i++) {
+    uint8_t w = (uint8_t)constrain(
+      140 + random(-20 - crazyness * 3, 35 + crazyness * 6),
+      40, 255
+    );
+    RGBW c{(uint8_t)(w / 6), (uint8_t)(w / 12), (uint8_t)(w / 20), w};
+    setPixelRGBW(i, c);
+  }
+  pixels.show();
+}
+
+// --- Effect 4: Disco Plasma ---
+void fxDiscoPlasma(uint32_t now) {
+  uint8_t t8 = (uint8_t)(now / (uint32_t)(6 + (11 - speed)));
+  for (uint16_t i = 0; i < NUMPIXELS; i++) {
+    uint8_t h = (uint8_t)(hueBase + (t8 * (6 + crazyness)) + i * (40 - crazyness));
+    uint8_t v = (uint8_t)(140 + (uint8_t)(random(0, 30 + crazyness * 6)));
+    RGBW rgb = hsv2rgb(h, 255, v);
+    RGBW c   = rgb_to_rgbw_with_temp(rgb.r, rgb.g, rgb.b, temp, 160);
+    setPixelRGBW(i, c);
+  }
+  pixels.show();
+}
